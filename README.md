@@ -4,7 +4,7 @@
 
 - **scPDSI Cell Selection**: Selects relevant scPDSI cells within a specified radius around an observation point.
 - **Cell Mapping**: Visualizes the selected scPDSI cells on a map and, if enabled, highlights the major basin in which the observation point is located.
-- **Stepwise Linear Regression (SLR)**: Conducts paleoclimate reconstruction using SLR, optimizing predictor variables and calculating performance metrics such as R² and VIF.
+- **Stepwise Linear Regression (SLR)**: Conducts paleoclimate reconstruction using SLR, optimizing predictor variables and calculating performance metrics such as R², DW and VIF.
 - **Bias Correction**: Applies Quantile Mapping (RQUANT) for bias correction, aligning reconstructed values more closely with observed data.
 
 ## Installation Requirements
