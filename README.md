@@ -75,3 +75,14 @@ Once all fields are filled, press the **Reconstruct** button. The application wi
    - Data from selected cells.
    - SLR results.
 
+## Citation
+
+If you use **PALEO-RECON** in your research, please cite it in either of these two ways:
+
+1. **To cite PALEO-RECON as introduced in**:
+   > Ramírez Molina, A.A., Tootle, G., Formetta, G., Piechota, T., Gong, J., "Extraordinary 21st Century Drought in the Po River Basin (Italy)," *Submitted to Hydrology*, 2024.
+   *Once the paper is published, please update the citation accordingly.*
+
+2. **To cite the PALEO-RECON software directly**:
+    > Ramírez Molina, A. A. (2024). PALEO-RECON: An Automated Tool for Paleoclimate Reconstructions [Software] (v.1.0.0). Zenodo. DOI: [10.5281/zenodo.14061377](https://doi.org/10.5281/zenodo.14061377)
+
