@@ -197,7 +197,7 @@ def stepwise_linear_regression(df, id_var, target_var, alpha_enter, alpha_remove
     X = df.drop(columns=[id_var, target_var])
     y = df[target_var]
     model, selected_predictors = run_stepwise(X, y, alpha_enter, alpha_remove)
-    
+
     # Check for negative coefficients and re-run if necessary
     while any(model.params[1:] < 0):  # Skip the intercept
         positive_predictors = [predictor for predictor, coef in zip(selected_predictors, model.params[1:]) if coef > 0]
@@ -308,7 +308,10 @@ def run_stepwise_regression(input_file, predictor_file, window_size, output_dire
         start_year = df_window['Year'].iloc[0]
         end_year = df_window['Year'].iloc[-1]
         reconstruction_window = f"{start_year}-{end_year}"
-        slr_reconstructions_df[reconstruction_window] = reconstruction_df['reconstructedData'].values
+        slr_reconstructions_df[reconstruction_window] = np.nan
+        valid_years = reconstruction_df['Year']
+        mask = slr_reconstructions_df['Year'].isin(valid_years)
+        slr_reconstructions_df.loc[mask, reconstruction_window] = reconstruction_df['reconstructedData'].values
 
     export_df_list(stats_list, os.path.join(output_directory, 'slr_stats.xlsx'), single_sheet=True, single_sheet_name='stats')
     export_df_list(predictions_list, os.path.join(output_directory, 'slr_predictions.xlsx'))
