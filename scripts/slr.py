@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from scipy import stats
 from scipy.stats import pearsonr
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
@@ -7,6 +8,32 @@ from statsmodels.stats.stattools import durbin_watson
 import os
 import zipfile as zf
 from .bias_correction import bias_correction
+
+def _correlations_and_pvalues(obs, predictors):
+    obs = np.asarray(obs, dtype=float)
+    predictors = np.asarray(predictors, dtype=float)
+    n = len(obs)
+
+    if predictors.shape[1] == 0:
+        return np.array([]), np.array([])
+
+    obs_centered = obs - obs.mean()
+    predictors_centered = predictors - predictors.mean(axis=0)
+    obs_norm = np.linalg.norm(obs_centered)
+    predictor_norms = np.linalg.norm(predictors_centered, axis=0)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        correlations = obs_centered.dot(predictors_centered) / (obs_norm * predictor_norms)
+
+    correlations = np.clip(correlations, -1.0, 1.0)
+
+    if n == 2:
+        p_values = np.ones_like(correlations, dtype=float)
+    else:
+        distribution = stats.beta(n / 2 - 1, n / 2 - 1, loc=-1, scale=2)
+        p_values = 2 * distribution.sf(np.abs(correlations))
+
+    return correlations, p_values
 
 def correlated_vectors(df, p_value_threshold=0.01):
     """
@@ -20,14 +47,17 @@ def correlated_vectors(df, p_value_threshold=0.01):
     Returns:
         pd.DataFrame: DataFrame containing only the significant columns.
     """
-    significant_vectors = ["Year", "obsData"]
-    
-    # Calculate the correlation between the observed data and each column
-    for column in df.columns[2:]:
-        correlation, p_value = pearsonr(df["obsData"], df[column])
-        # Select vector if the correlation is positive and the p-value is below the threshold
-        if correlation > 0 and p_value <= p_value_threshold:
-            significant_vectors.append(column)
+    predictor_columns = list(df.columns[2:])
+    correlations, p_values = _correlations_and_pvalues(
+        df["obsData"].to_numpy(),
+        df[predictor_columns].to_numpy()
+    )
+    significant_predictors = [
+        column
+        for column, correlation, p_value in zip(predictor_columns, correlations, p_values)
+        if correlation > 0 and p_value <= p_value_threshold
+    ]
+    significant_vectors = ["Year", "obsData"] + significant_predictors
     
     return df[significant_vectors]
 
@@ -43,24 +73,30 @@ def stability_filter(df):
     """
     # Determine the window size based on the length of the DataFrame
     window_size = len(df) // 3
-    correlations_list = []
+    predictor_columns = list(df.columns[2:])
+    if not predictor_columns:
+        return df
     
     # Calculate the correlation between the observed data and each column over a rolling window
+    unstable_columns = set()
     for start in range(0, len(df) - window_size + 1):
         end = start + window_size
         window_data = df.iloc[start:end]
-        correlations = {}
-        for column in df.columns[2:]:
-            correlation, _ = pearsonr(window_data["obsData"], window_data[column])
-            correlations[column] = correlation
-        correlations_list.append(correlations)
-    
-    df_correlations = pd.DataFrame(correlations_list)
-    
-    # Remove columns with negative correlations
-    for column in df_correlations.columns:
-        if (df_correlations[column] < 0).any():
-            df = df.drop(column, axis=1)
+        correlations, _ = _correlations_and_pvalues(
+            window_data["obsData"].to_numpy(),
+            window_data[predictor_columns].to_numpy()
+        )
+        unstable_columns.update(
+            column
+            for column, correlation in zip(predictor_columns, correlations)
+            if correlation < 0
+        )
+
+        if len(unstable_columns) == len(predictor_columns):
+            break
+
+    if unstable_columns:
+        df = df.drop(columns=list(unstable_columns))
     
     return df
 
@@ -141,35 +177,25 @@ def sign_test_comparison(observed, predicted):
 
 def stepwise_linear_regression(df, id_var, target_var, alpha_enter, alpha_remove, predictor_df):
     """
-    Perform stepwise linear regression on the data.
-    
-    Args:
-        df (pd.DataFrame): DataFrame containing the data.
-        id_var (str): Name of the ID variable.
-        target_var (str): Name of the target variable.
-        alpha_enter (float): Significance level for adding predictors.
-        alpha_remove (float): Significance level for removing predictors.
-        predictor_df (pd.DataFrame): DataFrame containing all years with predictors.
-    
-    Returns:
-        pd.DataFrame: DataFrame containing the regression statistics.
-        pd.DataFrame: DataFrame containing the predicted values.
-        pd.DataFrame: DataFrame containing the reconstructed values for all years.
+    Perform stepwise linear regression with a recursive sign constraint.
+    If a predictor yields a negative coefficient, it is permanently removed 
+    from the candidate pool, and the stepwise process restarts.
     """
-    def run_stepwise(X, y, alpha_enter, alpha_remove):
+    
+    def run_stepwise(X, y, a_enter, a_remove):
         selected_predictors = []
         remaining_predictors = list(X.columns)
         
         while True:
             changed = False
-            
             # Forward step: add the best predictor based on p-value
             best_pval = 1
             best_predictor = None
             for predictor in remaining_predictors:
+                # Add constant to the subset of selected + the new candidate
                 model = sm.OLS(y, sm.add_constant(X[selected_predictors + [predictor]])).fit()
                 pval = model.pvalues[predictor]
-                if pval < alpha_enter and pval < best_pval:
+                if pval < a_enter and pval < best_pval:
                     best_pval = pval
                     best_predictor = predictor
             
@@ -179,10 +205,13 @@ def stepwise_linear_regression(df, id_var, target_var, alpha_enter, alpha_remove
                 changed = True
             
             # Backward step: remove the worst predictor based on p-value
+            if not selected_predictors:
+                break
+                
             model = sm.OLS(y, sm.add_constant(X[selected_predictors])).fit()
             pvalues = model.pvalues.drop('const')
             worst_pval = pvalues.max()
-            if worst_pval > alpha_remove:
+            if worst_pval > a_remove:
                 remove_predictor = pvalues.idxmax()
                 selected_predictors.remove(remove_predictor)
                 remaining_predictors.append(remove_predictor)
@@ -191,72 +220,85 @@ def stepwise_linear_regression(df, id_var, target_var, alpha_enter, alpha_remove
             if not changed:
                 break
         
-        return sm.OLS(y, sm.add_constant(X[selected_predictors])).fit(), selected_predictors
+        # Return the final model and the list of names
+        final_model = sm.OLS(y, sm.add_constant(X[selected_predictors])).fit()
+        return final_model, selected_predictors
 
-    # Initial stepwise regression
-    X = df.drop(columns=[id_var, target_var])
-    y = df[target_var]
-    model, selected_predictors = run_stepwise(X, y, alpha_enter, alpha_remove)
-
-    # Check for negative coefficients and re-run if necessary
-    while any(model.params[1:] < 0):  # Skip the intercept
-        positive_predictors = [predictor for predictor, coef in zip(selected_predictors, model.params[1:]) if coef > 0]
-        if not positive_predictors:
-            break
-        model, selected_predictors = run_stepwise(X[positive_predictors], y, alpha_enter, alpha_remove)
+    # --- New Recursive Logic Starts Here ---
     
-    # Get the regression equation
-    coefficients = model.params
-    equation_terms = ["{} ({})".format(coefficients[col], col) for col in selected_predictors]
-    equation = "predicted = {} + {}".format(coefficients['const'], ' + '.join(equation_terms))
+    # 1. Define the initial pool of all possible candidates
+    current_candidates = list(df.drop(columns=[id_var, target_var]).columns)
+    y = df[target_var]
+    model = None
+    selected_predictors = []
 
-    # Calculate regression statistics
+    while True:
+        # 2. Run stepwise using only the current allowed candidates
+        X_current = df[current_candidates]
+        model, selected_predictors = run_stepwise(X_current, y, alpha_enter, alpha_remove)
+        
+        # If no predictors were selected, we stop to avoid infinite loops
+        if not selected_predictors:
+            break
+            
+        # 3. Check for negative coefficients (ignoring the intercept at index 0)
+        # model.params contains [const, pred1, pred2...]
+        negative_predictors = [p for p, coef in zip(selected_predictors, model.params[1:]) if coef < 0]
+        
+        if negative_predictors:
+            # 4. EXCLUSION STEP: Remove negative predictors from the TOTAL candidate pool
+            for p in negative_predictors:
+                if p in current_candidates:
+                    current_candidates.remove(p)
+            # The loop continues and restarts the stepwise process with fewer candidates
+        else:
+            # All selected predictors have positive coefficients: SUCCESS
+            break
+
+    # --- End of Recursive Logic ---
+
+    # Get the final regression equation for reporting
+    coefficients = model.params
+    if selected_predictors:
+        equation_terms = ["{:.4f} ({})".format(coefficients[col], col) for col in selected_predictors]
+        equation = "predicted = {:.4f} + {}".format(coefficients['const'], ' + '.join(equation_terms))
+    else:
+        equation = "No significant predictors found"
+
+    # Statistics Calculation (R2, R2_pred, etc.)
     r2 = model.rsquared
 
-    # Perform cross-validation to calculate r2_pred
     def calculate_r2_pred(df_copy, predictors, target):
-        preds = []
-        actuals = []
-        for i in df_copy.index:
-            df_train = df_copy.drop(index=i)
-            df_test = df_copy.loc[[i]]
-            model = sm.OLS(df_train[target], sm.add_constant(df_train[predictors])).fit()
-            
-            # Adjust shapes for prediction
-            const_test = sm.add_constant(df_test[predictors])
-            const_test = const_test.reindex(columns=model.params.index, fill_value=1)
-            
-            prediction = model.predict(const_test)
-            preds.append(prediction.iloc[0])
-            actuals.append(df_test[target].iloc[0])
-        
-        # Calculate R² for the cross-validated predictions
-        ss_res = sum((np.array(actuals) - np.array(preds)) ** 2)
-        ss_tot = sum((np.array(actuals) - np.mean(actuals)) ** 2)
-        r2_pred = 1 - (ss_res / ss_tot)
-        return r2_pred
+        if not predictors: return 0
+        actuals = df_copy[target].to_numpy()
+        residuals = model.resid.to_numpy()
+        leverage = model.get_influence().hat_matrix_diag
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            loo_errors = residuals / (1 - leverage)
+
+        ss_res = np.sum(loo_errors ** 2)
+        ss_tot = np.sum((actuals - np.mean(actuals)) ** 2)
+        return 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
 
     r2_pred = calculate_r2_pred(df, selected_predictors, target_var)
 
-    # Verify if there is only one predictor to avoid VIF calculation
-    if len(selected_predictors) == 1:
-        vif = [1]
+    # VIF and Durbin-Watson
+    if len(selected_predictors) <= 1:
+        vif = [1] if selected_predictors else [0]
     else:
         try:
-            vif = [variance_inflation_factor(df[selected_predictors].values, i) for i in range(df[selected_predictors].shape[1])]
-        except np.linalg.LinAlgError:
-            vif = ["Collinearity detected"] * len(selected_predictors)
+            vif = [variance_inflation_factor(df[selected_predictors].values, i) for i in range(len(selected_predictors))]
+        except:
+            vif = ["Collinearity error"]
 
     dw = durbin_watson(model.resid)
     sign_test_result = sign_test_comparison(y, model.predict(sm.add_constant(df[selected_predictors])))
 
-    # Add column 'Year' to the stats_df DataFrame
-    start_year = df['Year'].iloc[0]
-    end_year = df['Year'].iloc[-1]
-    years = f"{start_year}-{end_year}"
-    
+    # Prepare outputs
+    start_year, end_year = df['Year'].iloc[0], df['Year'].iloc[-1]
     stats_df = pd.DataFrame({
-        'Years': [years],
+        'Years': [f"{start_year}-{end_year}"],
         'R^2': [r2],
         'R^2 Predicted': [r2_pred],
         'VIF': [vif],
@@ -267,17 +309,13 @@ def stepwise_linear_regression(df, id_var, target_var, alpha_enter, alpha_remove
 
     df_output = df[[id_var, target_var] + selected_predictors].copy()
     df_output['predictedData'] = model.predict(sm.add_constant(df[selected_predictors]))
-    df_output = df_output[[id_var, target_var, 'predictedData'] + selected_predictors]
 
-    # Apply the model to the predictor_df for reconstruction
-    reconstruction_df = predictor_df[['YEAR'] + selected_predictors].copy()
-    reconstruction_df = reconstruction_df.rename(columns={'YEAR': 'Year'})
+    reconstruction_df = predictor_df[['YEAR'] + selected_predictors].copy().rename(columns={'YEAR': 'Year'})
     reconstruction_df['reconstructedData'] = model.predict(sm.add_constant(predictor_df[selected_predictors]))
     reconstruction_df = pd.merge(reconstruction_df, df[['Year', target_var]], on='Year', how='left')
-    reconstruction_df = reconstruction_df[['Year', target_var, 'reconstructedData'] + selected_predictors]
-    reconstruction_df = reconstruction_df[reconstruction_df['reconstructedData'].notna()]
 
     return stats_df, df_output, reconstruction_df
+
 
 def run_stepwise_regression(input_file, predictor_file, window_size, output_directory):
     """
@@ -299,6 +337,7 @@ def run_stepwise_regression(input_file, predictor_file, window_size, output_dire
     predictions_list = []
     reconstructions_list = []
     slr_reconstructions_df = pd.DataFrame({'Year': predictor_df['YEAR']})
+    reconstruction_columns = {}
     for df_window in df_list:
         stats_df, prediction_df, reconstruction_df = stepwise_linear_regression(df_window, 'Year', 'obsData', 0.05, 0.1, predictor_df)
         stats_list.append(stats_df)
@@ -308,10 +347,14 @@ def run_stepwise_regression(input_file, predictor_file, window_size, output_dire
         start_year = df_window['Year'].iloc[0]
         end_year = df_window['Year'].iloc[-1]
         reconstruction_window = f"{start_year}-{end_year}"
-        slr_reconstructions_df[reconstruction_window] = np.nan
-        valid_years = reconstruction_df['Year']
-        mask = slr_reconstructions_df['Year'].isin(valid_years)
-        slr_reconstructions_df.loc[mask, reconstruction_window] = reconstruction_df['reconstructedData'].values
+        reconstruction_series = reconstruction_df.drop_duplicates('Year').set_index('Year')['reconstructedData']
+        reconstruction_columns[reconstruction_window] = slr_reconstructions_df['Year'].map(reconstruction_series)
+
+    if reconstruction_columns:
+        slr_reconstructions_df = pd.concat(
+            [slr_reconstructions_df, pd.DataFrame(reconstruction_columns)],
+            axis=1
+        ).copy()
 
     export_df_list(stats_list, os.path.join(output_directory, 'slr_stats.xlsx'), single_sheet=True, single_sheet_name='stats')
     export_df_list(predictions_list, os.path.join(output_directory, 'slr_predictions.xlsx'))
@@ -327,4 +370,3 @@ def run_stepwise_regression(input_file, predictor_file, window_size, output_dire
         zipObj.write(os.path.join(output_directory, 'slr_predictions.xlsx'), arcname='slr_predictions.xlsx')
         zipObj.write(os.path.join(output_directory, 'slr_reconstructions.xlsx'), arcname='slr_reconstructions.xlsx')
         zipObj.write(os.path.join(output_directory, 'slr_bias_correction.xlsx'), arcname='slr_bias_correction.xlsx')
-
